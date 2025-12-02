@@ -41,7 +41,7 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-const appId = "p-arc-web-v1"; // This is a unique name for your data folder
+const appId = "p-arc-web-v1";
 
 /* --- Helper: Connection Hook --- */
 const useConnectionStatus = () => {
@@ -60,12 +60,10 @@ const useConnectionStatus = () => {
 };
 
 /* --- WebRTC Manager --- */
-// Manages P2P connections for streaming the owner's video to guests
 const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
   const [remoteStream, setRemoteStream] = useState(null);
   const peerConnections = useRef({}); // { [targetUserId]: RTCPeerConnection }
   
-  // Public STUN servers for NAT traversal
   const rtcConfig = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -73,7 +71,15 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
     ]
   };
 
-  // 1. SIGNALING: Listen for incoming signals (Offers/Answers/ICE)
+  // Cleanup on unmount (CRITICAL FIX)
+  useEffect(() => {
+    return () => {
+      Object.values(peerConnections.current).forEach(pc => pc.close());
+      peerConnections.current = {};
+    };
+  }, []);
+
+  // 1. SIGNALING
   useEffect(() => {
     if (!roomId || !userId) return;
 
@@ -87,8 +93,6 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
         if (change.type === 'added') {
           const data = change.doc.data();
           const fromUser = data.from;
-          
-          // Delete processed signal to keep DB clean
           deleteDoc(change.doc.ref);
 
           if (!peerConnections.current[fromUser]) {
@@ -98,14 +102,17 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
 
           try {
             if (data.type === 'offer') {
+              if (pc.signalingState !== 'stable') return; // Prevent glare
               await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
               const answer = await pc.createAnswer();
               await pc.setLocalDescription(answer);
               sendSignal(fromUser, 'answer', answer);
             } else if (data.type === 'answer') {
-              await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
+              if (pc.signalingState === 'have-local-offer') {
+                 await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
+              }
             } else if (data.type === 'ice') {
-              if (data.payload) {
+              if (data.payload && pc.remoteDescription) {
                 await pc.addIceCandidate(new RTCIceCandidate(data.payload));
               }
             }
@@ -119,13 +126,12 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
     return () => unsubscribe();
   }, [roomId, userId, isOwner]);
 
-  // 2. OWNER: Manage Connections for Guests
+  // 2. OWNER: Connection Management
   useEffect(() => {
     if (!isOwner || !localStream) return;
 
     activeUsers.forEach(u => {
       if (u.uid !== userId && !peerConnections.current[u.uid]) {
-        // New user found, initiate connection
         setupPeerConnection(u.uid, true);
       }
     });
@@ -138,26 +144,22 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnections.current[targetId] = pc;
 
-    // ICE Candidates
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         sendSignal(targetId, 'ice', event.candidate);
       }
     };
 
-    // Handle Stream (Guest Side)
     pc.ontrack = (event) => {
       setRemoteStream(event.streams[0]);
     };
 
-    // Add Tracks (Owner Side)
     if (localStream) {
       localStream.getTracks().forEach(track => {
         pc.addTrack(track, localStream);
       });
     }
 
-    // Create Offer (Owner Side)
     if (isInitiator) {
       try {
         const offer = await pc.createOffer();
@@ -170,13 +172,11 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
   };
 
   const sendSignal = async (to, type, payload) => {
-    // We create a new doc for every signal. 
-    // This is chatty but simplest for Firestore without complex queue logic.
     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', `parc_v2_${roomId}_signals`), {
       to,
       from: userId,
       type,
-      payload: JSON.parse(JSON.stringify(payload)), // Sanitize for Firestore
+      payload: JSON.parse(JSON.stringify(payload)),
       timestamp: serverTimestamp()
     });
   };
@@ -195,35 +195,30 @@ const StreamedVideoPlayer = ({
   roomId,
   userId
 }) => {
-  const videoRef = useRef(null); // The actual video element (Owner: Local File, Guest: WebRTC Stream)
+  const videoRef = useRef(null);
   const [localFileUrl, setLocalFileUrl] = useState(null);
   const [streamActive, setStreamActive] = useState(false);
   const [capturedStream, setCapturedStream] = useState(null);
 
-  // Initialize WebRTC
   const { remoteStream } = useWebRTCStream(roomId, userId, isOwner, activeUsers, capturedStream);
 
-  // Handle local file selection (Owner only)
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
     if (file) {
       const url = URL.createObjectURL(file);
       setLocalFileUrl(url);
       
-      // Update room state
+      // Update room state with a UNIQUE streamId to force reset everywhere
       onUpdateState({ 
         videoName: file.name,
-        isPlaying: false,
-        isStreaming: true
+        isStreaming: true,
+        streamId: Date.now() // Critical fix: Force unique session ID
       });
     }
   };
 
-  // Setup Stream Capture (Owner)
   useEffect(() => {
     if (isOwner && videoRef.current && localFileUrl && !capturedStream) {
-      // Capture the stream from the video element
-      // mozCaptureStream for Firefox compatibility if needed, but standard is captureStream
       const stream = videoRef.current.captureStream ? videoRef.current.captureStream() : videoRef.current.mozCaptureStream();
       if (stream) {
         setCapturedStream(stream);
@@ -232,17 +227,14 @@ const StreamedVideoPlayer = ({
     }
   }, [isOwner, localFileUrl, capturedStream]);
 
-  // Attach Remote Stream (Guest)
   useEffect(() => {
     if (!isOwner && videoRef.current && remoteStream) {
       videoRef.current.srcObject = remoteStream;
-      // Auto-play required for streams
       videoRef.current.play().catch(e => console.log("Stream autoplay blocked", e));
       setStreamActive(true);
     }
   }, [isOwner, remoteStream]);
 
-  // Volume Control
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.volume = volume;
@@ -252,7 +244,6 @@ const StreamedVideoPlayer = ({
 
   /* --- RENDER LOGIC --- */
 
-  // 1. OWNER: No file selected
   if (isOwner && !localFileUrl) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-slate-400 bg-slate-900/50 rounded-xl border border-slate-700 p-8 border-dashed animate-in fade-in zoom-in">
@@ -270,7 +261,6 @@ const StreamedVideoPlayer = ({
     );
   }
 
-  // 2. GUEST: Waiting for stream
   if (!isOwner && !streamActive && !remoteStream) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-slate-400 bg-slate-900/50 rounded-xl border border-slate-700 p-8 animate-in fade-in zoom-in">
@@ -288,27 +278,21 @@ const StreamedVideoPlayer = ({
     );
   }
 
-  // 3. PLAYER (Both)
   return (
     <div className="relative w-full h-full flex items-center justify-center bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-slate-800 group">
-      {/* Video Element */}
       <video
         ref={videoRef}
         src={isOwner ? localFileUrl : undefined}
         className="w-full h-full object-contain"
-        controls={isOwner} // Only owner has controls
+        controls={isOwner}
         playsInline
       />
-      
-      {/* Guest Overlay: "Live" badge */}
       {!isOwner && (
         <div className="absolute top-4 left-4 bg-red-600/90 backdrop-blur-md text-white text-xs font-bold px-3 py-1.5 rounded-md flex items-center gap-2 shadow-lg z-20">
           <div className="w-2 h-2 rounded-full bg-white animate-pulse"></div>
           LIVE BROADCAST
         </div>
       )}
-
-      {/* Owner Overlay: "Broadcasting" badge */}
       {isOwner && (
         <div className="absolute top-4 left-4 bg-blue-600/90 backdrop-blur-md text-white text-xs font-bold px-3 py-1.5 rounded-md flex items-center gap-2 shadow-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-20">
           <Activity size={12} />
@@ -335,12 +319,12 @@ export default function PArcApp() {
   
   // App State (Synced)
   const [roomState, setRoomState] = useState({ 
-    activeMode: 'none', // 'video', 'screen'
+    activeMode: 'none', 
     videoName: '',
-    isStreaming: false
+    isStreaming: false,
+    streamId: 0 // New field for session tracking
   });
 
-  // Local UI State
   const [inputMsg, setInputMsg] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [micVolume, setMicVolume] = useState(1);
@@ -360,10 +344,12 @@ export default function PArcApp() {
   /* --- Authentication & Init --- */
   useEffect(() => {
     const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
+      // FIX: Removed the custom-token logic that caused the mismatch.
+      // We now strictly use Anonymous Auth which works with your keys.
+      try {
         await signInAnonymously(auth);
+      } catch (error) {
+        console.error("Auth Failed:", error);
       }
     };
     initAuth();
@@ -380,7 +366,6 @@ export default function PArcApp() {
   useEffect(() => {
     if (!user || view !== 'room' || !roomData.id) return;
 
-    // 1. Join Presence
     const userRef = doc(db, 'artifacts', appId, 'public', 'data', `parc_v2_${roomData.id}_users`, user.uid);
     setDoc(userRef, {
       uid: user.uid,
@@ -390,12 +375,10 @@ export default function PArcApp() {
       joinedAt: serverTimestamp()
     });
 
-    // 2. Listen Users
     const unsubUsers = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', `parc_v2_${roomData.id}_users`), (snap) => {
       setActiveUsers(snap.docs.map(d => d.data()));
     });
 
-    // 3. Listen Messages
     const unsubMsgs = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', `parc_v2_${roomData.id}_messages`), (snap) => {
       const msgs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
       msgs.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
@@ -403,13 +386,12 @@ export default function PArcApp() {
       setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
     });
 
-    // 4. Listen Room State
     const stateRef = doc(db, 'artifacts', appId, 'public', 'data', `parc_v2_${roomData.id}_state`, 'main');
     const unsubState = onSnapshot(stateRef, (snap) => {
       if (snap.exists()) {
         setRoomState(prev => ({ ...prev, ...snap.data() }));
       } else if (isOwner) {
-        setDoc(stateRef, { activeMode: 'none', isStreaming: false });
+        setDoc(stateRef, { activeMode: 'none', isStreaming: false, streamId: 0 });
       }
     });
 
@@ -436,7 +418,7 @@ export default function PArcApp() {
   };
 
   const updateGlobalState = async (updates) => {
-    if (!isOwner) return; // Security check
+    if (!isOwner) return;
     try {
       const ref = doc(db, 'artifacts', appId, 'public', 'data', `parc_v2_${roomData.id}_state`, 'main');
       await updateDoc(ref, updates);
@@ -460,7 +442,6 @@ export default function PArcApp() {
 
   /* --- Local Media Handlers --- */
   
-  // Camera
   useEffect(() => {
     if (localMedia.video && videoPreviewRef.current) {
       navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
@@ -473,7 +454,6 @@ export default function PArcApp() {
     }
   }, [localMedia.video]);
 
-  // Screen Share (Local Only for demo, sets state for others)
   const toggleScreenShare = async () => {
     if (!localMedia.screen) {
       try {
@@ -510,7 +490,6 @@ export default function PArcApp() {
   if (view === 'landing') {
     return (
       <div className="min-h-screen bg-slate-950 text-white flex flex-col items-center justify-center p-6 relative overflow-hidden font-sans">
-        {/* Abstract Background */}
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black pointer-events-none"></div>
         <div className="absolute top-0 left-0 w-full h-full opacity-20 pointer-events-none" style={{ backgroundImage: 'radial-gradient(#4f46e5 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
         
@@ -575,14 +554,12 @@ export default function PArcApp() {
   return (
     <div className="h-screen bg-black text-slate-200 flex flex-col overflow-hidden font-sans">
       
-      {/* 1. Offline Banner */}
       {!isOnline && (
         <div className="bg-red-600 text-white text-xs font-bold text-center py-1 flex items-center justify-center gap-2 animate-pulse z-50">
           <WifiOff size={14} /> Connection Lost - Attempting to Reconnect...
         </div>
       )}
 
-      {/* 2. Header */}
       <header className="h-16 bg-slate-950/80 border-b border-slate-900 flex items-center justify-between px-6 shrink-0 z-20 backdrop-blur-md">
         <div className="flex items-center gap-4">
           <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center font-bold text-white shadow-lg text-lg">P</div>
@@ -605,10 +582,8 @@ export default function PArcApp() {
         </button>
       </header>
 
-      {/* 3. Main Content Area */}
       <div className="flex-1 flex overflow-hidden">
         
-        {/* Left: User List (Collapsible on mobile) */}
         <div className="w-20 bg-slate-950 border-r border-slate-900 hidden sm:flex flex-col items-center py-6 gap-4 overflow-y-auto">
            {activeUsers.map(u => (
              <div key={u.uid} className="relative group cursor-default">
@@ -627,16 +602,12 @@ export default function PArcApp() {
            ))}
         </div>
 
-        {/* Center: Stage */}
         <div className="flex-1 bg-black relative flex flex-col">
           
-          {/* STAGE CONTENT */}
           <div className="flex-1 p-4 flex items-center justify-center relative overflow-hidden">
              
-             {/* Background Grid */}
              <div className="absolute inset-0 opacity-10" style={{ backgroundImage: 'linear-gradient(#333 1px, transparent 1px), linear-gradient(90deg, #333 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
 
-             {/* MODE: NONE */}
              {roomState.activeMode === 'none' && (
                <div className="z-10 text-center space-y-6 max-w-md animate-in fade-in zoom-in duration-500">
                  <div className="w-24 h-24 bg-slate-900 rounded-3xl mx-auto flex items-center justify-center shadow-2xl border border-slate-800">
@@ -653,11 +624,10 @@ export default function PArcApp() {
                </div>
              )}
 
-             {/* MODE: VIDEO BROADCAST */}
              {roomState.activeMode === 'video' && (
                <div className="w-full h-full max-w-6xl max-h-[80vh] z-10 animate-in zoom-in-95 duration-300">
                  <StreamedVideoPlayer 
-                    key={`${roomState.videoName}-${roomState.isStreaming}`} 
+                    key={roomState.streamId || 'initial'} 
                     isOwner={isOwner} 
                     roomState={roomState} 
                     onUpdateState={updateGlobalState} 
@@ -669,7 +639,6 @@ export default function PArcApp() {
                </div>
              )}
 
-             {/* MODE: SCREEN SHARE */}
              {roomState.activeMode === 'screen' && (
                <div className="w-full h-full z-10 flex items-center justify-center p-8">
                   {localMedia.screen ? (
@@ -695,7 +664,6 @@ export default function PArcApp() {
                </div>
              )}
 
-             {/* Local Webcam Pip */}
              {localMedia.video && (
                <div className="absolute bottom-6 left-6 w-48 aspect-video bg-black rounded-lg border border-slate-700 shadow-2xl overflow-hidden z-20 animate-in slide-in-from-bottom-10">
                  <video ref={videoPreviewRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1]" />
@@ -705,10 +673,8 @@ export default function PArcApp() {
 
           </div>
 
-          {/* BOTTOM TOOLBAR */}
           <div className="bg-slate-950 border-t border-slate-900 p-3 flex flex-col md:flex-row items-center justify-between gap-4 z-30">
              
-             {/* Left: Volume Controls */}
              <div className="flex items-center gap-6 px-4 py-2 bg-slate-900 rounded-xl border border-slate-800 w-full md:w-auto">
                <div className="flex flex-col gap-1 w-24">
                  <div className="flex justify-between text-[10px] uppercase font-bold text-slate-500">
@@ -741,7 +707,6 @@ export default function PArcApp() {
                </div>
              </div>
 
-             {/* Center: Main Actions */}
              <div className="flex items-center gap-3">
                <button 
                   onClick={() => setLocalMedia(p => ({ ...p, audio: !p.audio }))}
@@ -782,7 +747,6 @@ export default function PArcApp() {
                )}
              </div>
 
-             {/* Right: Toggle Chat Mobile */}
              <div className="md:hidden">
                 <button 
                   onClick={() => setIsSidebarOpen(!isSidebarOpen)} 
@@ -792,13 +756,11 @@ export default function PArcApp() {
                 </button>
              </div>
              
-             {/* Spacer for Desktop Balance */}
              <div className="hidden md:block w-[280px]"></div>
 
           </div>
         </div>
 
-        {/* Right: Chat Sidebar */}
         <div className={`${isSidebarOpen ? 'translate-x-0' : 'translate-x-full'} absolute md:static inset-y-0 right-0 w-full md:w-80 bg-slate-950 border-l border-slate-900 transition-transform duration-300 z-40 flex flex-col`}>
           <div className="p-4 border-b border-slate-900 flex justify-between items-center bg-slate-950">
              <h3 className="font-bold text-slate-300 text-sm uppercase tracking-wider">Chat</h3>
