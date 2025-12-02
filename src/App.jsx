@@ -60,9 +60,10 @@ const useConnectionStatus = () => {
 };
 
 /* --- WebRTC Manager --- */
-const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
+// Now accepts streamId to trigger resets internally
+const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, streamId) => {
   const [remoteStream, setRemoteStream] = useState(null);
-  const peerConnections = useRef({}); // { [targetUserId]: RTCPeerConnection }
+  const peerConnections = useRef({}); 
   
   const rtcConfig = {
     iceServers: [
@@ -71,13 +72,16 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
     ]
   };
 
-  // Cleanup on unmount (CRITICAL FIX)
+  // Full Cleanup when streamId changes (Soft Reset)
   useEffect(() => {
-    return () => {
-      Object.values(peerConnections.current).forEach(pc => pc.close());
-      peerConnections.current = {};
-    };
-  }, []);
+    // Close all existing connections
+    Object.values(peerConnections.current).forEach(pc => pc.close());
+    peerConnections.current = {};
+    setRemoteStream(null);
+    
+    // If we are owner, we will rebuild connections in the next effect
+    // If guest, we wait for new offers
+  }, [streamId]);
 
   // 1. SIGNALING
   useEffect(() => {
@@ -95,6 +99,9 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
           const fromUser = data.from;
           deleteDoc(change.doc.ref);
 
+          // Only accept signals relevant to current stream or generic
+          // (Simple implementations might just process everything)
+          
           if (!peerConnections.current[fromUser]) {
              setupPeerConnection(fromUser, !isOwner);
           }
@@ -102,7 +109,7 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
 
           try {
             if (data.type === 'offer') {
-              if (pc.signalingState !== 'stable') return; // Prevent glare
+              if (pc.signalingState !== 'stable') return; 
               await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
               const answer = await pc.createAnswer();
               await pc.setLocalDescription(answer);
@@ -124,7 +131,7 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
     });
 
     return () => unsubscribe();
-  }, [roomId, userId, isOwner]);
+  }, [roomId, userId, isOwner, streamId]); // Added streamId dependency
 
   // 2. OWNER: Connection Management
   useEffect(() => {
@@ -135,7 +142,7 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream) => {
         setupPeerConnection(u.uid, true);
       }
     });
-  }, [activeUsers, isOwner, localStream]);
+  }, [activeUsers, isOwner, localStream, streamId]); // Added streamId
 
   // 3. Setup PC
   const setupPeerConnection = async (targetId, isInitiator) => {
@@ -200,33 +207,40 @@ const StreamedVideoPlayer = ({
   const [streamActive, setStreamActive] = useState(false);
   const [capturedStream, setCapturedStream] = useState(null);
 
-  const { remoteStream } = useWebRTCStream(roomId, userId, isOwner, activeUsers, capturedStream);
+  // Pass streamId to hook so it knows when to reset connections
+  const { remoteStream } = useWebRTCStream(roomId, userId, isOwner, activeUsers, capturedStream, roomState.streamId);
 
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
     if (file) {
       const url = URL.createObjectURL(file);
       setLocalFileUrl(url);
+      setCapturedStream(null); // Reset capture so new stream is grabbed
       
-      // Update room state with a UNIQUE streamId to force reset everywhere
       onUpdateState({ 
         videoName: file.name,
         isStreaming: true,
-        streamId: Date.now() // Critical fix: Force unique session ID
+        streamId: Date.now() // Signals everyone to restart connection logic
       });
     }
   };
 
+  // Owner: Capture Stream from Video Element
   useEffect(() => {
     if (isOwner && videoRef.current && localFileUrl && !capturedStream) {
-      const stream = videoRef.current.captureStream ? videoRef.current.captureStream() : videoRef.current.mozCaptureStream();
-      if (stream) {
-        setCapturedStream(stream);
-        setStreamActive(true);
-      }
+      // Small timeout to ensure video element has loaded source
+      const timer = setTimeout(() => {
+        const stream = videoRef.current.captureStream ? videoRef.current.captureStream() : videoRef.current.mozCaptureStream();
+        if (stream) {
+          setCapturedStream(stream);
+          setStreamActive(true);
+        }
+      }, 500);
+      return () => clearTimeout(timer);
     }
   }, [isOwner, localFileUrl, capturedStream]);
 
+  // Guest: Play Remote Stream
   useEffect(() => {
     if (!isOwner && videoRef.current && remoteStream) {
       videoRef.current.srcObject = remoteStream;
@@ -235,6 +249,7 @@ const StreamedVideoPlayer = ({
     }
   }, [isOwner, remoteStream]);
 
+  // Volume
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.volume = volume;
@@ -299,6 +314,17 @@ const StreamedVideoPlayer = ({
           Broadcasting to {activeUsers.length - 1} guests
         </div>
       )}
+      
+      {/* OWNER: Change Video Button Overlay */}
+      {isOwner && (
+        <div className="absolute bottom-4 right-4 z-30 opacity-0 group-hover:opacity-100 transition-opacity">
+           <label className="cursor-pointer bg-slate-800/80 hover:bg-blue-600 text-white text-xs font-bold py-2 px-4 rounded-full backdrop-blur flex items-center gap-2 transition-all">
+              <Upload size={14} />
+              <span>Change Video</span>
+              <input type="file" accept="video/*" className="hidden" onChange={handleFileSelect} />
+           </label>
+        </div>
+      )}
     </div>
   );
 };
@@ -322,7 +348,7 @@ export default function PArcApp() {
     activeMode: 'none', 
     videoName: '',
     isStreaming: false,
-    streamId: 0 // New field for session tracking
+    streamId: 0 
   });
 
   const [inputMsg, setInputMsg] = useState('');
@@ -344,8 +370,6 @@ export default function PArcApp() {
   /* --- Authentication & Init --- */
   useEffect(() => {
     const initAuth = async () => {
-      // FIX: Removed the custom-token logic that caused the mismatch.
-      // We now strictly use Anonymous Auth which works with your keys.
       try {
         await signInAnonymously(auth);
       } catch (error) {
@@ -627,7 +651,7 @@ export default function PArcApp() {
              {roomState.activeMode === 'video' && (
                <div className="w-full h-full max-w-6xl max-h-[80vh] z-10 animate-in zoom-in-95 duration-300">
                  <StreamedVideoPlayer 
-                    key={roomState.streamId || 'initial'} 
+                    // REMOVED KEY PROP to prevent unmounting
                     isOwner={isOwner} 
                     roomState={roomState} 
                     onUpdateState={updateGlobalState} 
