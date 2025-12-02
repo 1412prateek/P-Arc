@@ -657,6 +657,7 @@ export default function PArcApp() {
              {roomState.activeMode === 'video' && (
                <div className="w-full h-full max-w-6xl max-h-[80vh] z-10 animate-in zoom-in-95 duration-300">
                  <StreamedVideoPlayer 
+                    key={`${roomState.videoName}-${roomState.isStreaming}`} 
                     isOwner={isOwner} 
                     roomState={roomState} 
                     onUpdateState={updateGlobalState} 
