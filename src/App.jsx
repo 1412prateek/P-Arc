@@ -60,10 +60,10 @@ const useConnectionStatus = () => {
 };
 
 /* --- WebRTC Manager --- */
-// Now accepts streamId to trigger resets internally
 const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, streamId) => {
   const [remoteStream, setRemoteStream] = useState(null);
   const peerConnections = useRef({}); 
+  const peerSessionIds = useRef({}); // Tracks session IDs to handle refreshes
   
   const rtcConfig = {
     iceServers: [
@@ -74,13 +74,11 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, stre
 
   // Full Cleanup when streamId changes (Soft Reset)
   useEffect(() => {
-    // Close all existing connections
+    // Close all existing connections when stream changes
     Object.values(peerConnections.current).forEach(pc => pc.close());
     peerConnections.current = {};
+    peerSessionIds.current = {};
     setRemoteStream(null);
-    
-    // If we are owner, we will rebuild connections in the next effect
-    // If guest, we wait for new offers
   }, [streamId]);
 
   // 1. SIGNALING
@@ -97,10 +95,11 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, stre
         if (change.type === 'added') {
           const data = change.doc.data();
           const fromUser = data.from;
-          deleteDoc(change.doc.ref);
+          deleteDoc(change.doc.ref); // Consume signal
 
-          // Only accept signals relevant to current stream or generic
-          // (Simple implementations might just process everything)
+          // If we are owner, check if we need to setup a connection first?
+          // Actually, for incoming 'answer', we already have PC.
+          // For incoming 'offer' (Guest side), we create PC.
           
           if (!peerConnections.current[fromUser]) {
              setupPeerConnection(fromUser, !isOwner);
@@ -109,8 +108,21 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, stre
 
           try {
             if (data.type === 'offer') {
-              if (pc.signalingState !== 'stable') return; 
-              await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
+              if (pc.signalingState !== 'stable') {
+                 // Collision/glare handling: if we are polite (not owner), we might rollback
+                 // For simplicity, just proceed or ignore if busy
+                 if (!isOwner) {
+                    await Promise.all([
+                      pc.setLocalDescription({type: "rollback"}),
+                      pc.setRemoteDescription(new RTCSessionDescription(data.payload))
+                    ]);
+                 } else {
+                   return; 
+                 }
+              } else {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.payload));
+              }
+              
               const answer = await pc.createAnswer();
               await pc.setLocalDescription(answer);
               sendSignal(fromUser, 'answer', answer);
@@ -120,7 +132,7 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, stre
               }
             } else if (data.type === 'ice') {
               if (data.payload && pc.remoteDescription) {
-                await pc.addIceCandidate(new RTCIceCandidate(data.payload));
+                await pc.addIceCandidate(new RTCIceCandidate(data.payload)).catch(e => console.log("ICE Error", e));
               }
             }
           } catch (err) {
@@ -131,18 +143,35 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, stre
     });
 
     return () => unsubscribe();
-  }, [roomId, userId, isOwner, streamId]); // Added streamId dependency
+  }, [roomId, userId, isOwner, streamId]);
 
   // 2. OWNER: Connection Management
   useEffect(() => {
     if (!isOwner || !localStream) return;
 
-    activeUsers.forEach(u => {
-      if (u.uid !== userId && !peerConnections.current[u.uid]) {
-        setupPeerConnection(u.uid, true);
-      }
-    });
-  }, [activeUsers, isOwner, localStream, streamId]); // Added streamId
+    // Small delay to ensure "Video Element" is ready and old connections are dead
+    const timer = setTimeout(() => {
+      activeUsers.forEach(u => {
+        if (u.uid === userId) return;
+
+        // Check if this is a new session (refresh) or new user
+        const isNewSession = peerSessionIds.current[u.uid] !== u.sessionId;
+        
+        if (!peerConnections.current[u.uid] || isNewSession) {
+          // If connection existed but session changed, close it first
+          if (peerConnections.current[u.uid]) {
+            peerConnections.current[u.uid].close();
+            delete peerConnections.current[u.uid];
+          }
+          
+          peerSessionIds.current[u.uid] = u.sessionId;
+          setupPeerConnection(u.uid, true);
+        }
+      });
+    }, 500); 
+
+    return () => clearTimeout(timer);
+  }, [activeUsers, isOwner, localStream, streamId]); 
 
   // 3. Setup PC
   const setupPeerConnection = async (targetId, isInitiator) => {
@@ -159,6 +188,12 @@ const useWebRTCStream = (roomId, userId, isOwner, activeUsers, localStream, stre
 
     pc.ontrack = (event) => {
       setRemoteStream(event.streams[0]);
+    };
+
+    pc.onconnectionstatechange = () => {
+       if (pc.connectionState === 'failed') {
+          pc.restartIce();
+       }
     };
 
     if (localStream) {
@@ -207,7 +242,6 @@ const StreamedVideoPlayer = ({
   const [streamActive, setStreamActive] = useState(false);
   const [capturedStream, setCapturedStream] = useState(null);
 
-  // Pass streamId to hook so it knows when to reset connections
   const { remoteStream } = useWebRTCStream(roomId, userId, isOwner, activeUsers, capturedStream, roomState.streamId);
 
   const handleFileSelect = (e) => {
@@ -215,12 +249,13 @@ const StreamedVideoPlayer = ({
     if (file) {
       const url = URL.createObjectURL(file);
       setLocalFileUrl(url);
-      setCapturedStream(null); // Reset capture so new stream is grabbed
+      setCapturedStream(null); 
+      setStreamActive(false);
       
       onUpdateState({ 
         videoName: file.name,
         isStreaming: true,
-        streamId: Date.now() // Signals everyone to restart connection logic
+        streamId: Date.now() 
       });
     }
   };
@@ -228,14 +263,16 @@ const StreamedVideoPlayer = ({
   // Owner: Capture Stream from Video Element
   useEffect(() => {
     if (isOwner && videoRef.current && localFileUrl && !capturedStream) {
-      // Small timeout to ensure video element has loaded source
+      // Force play to ensure stream has data
+      videoRef.current.play().catch(() => {});
+      
       const timer = setTimeout(() => {
         const stream = videoRef.current.captureStream ? videoRef.current.captureStream() : videoRef.current.mozCaptureStream();
         if (stream) {
           setCapturedStream(stream);
           setStreamActive(true);
         }
-      }, 500);
+      }, 1000); // 1s delay to let video load
       return () => clearTimeout(timer);
     }
   }, [isOwner, localFileUrl, capturedStream]);
@@ -249,7 +286,6 @@ const StreamedVideoPlayer = ({
     }
   }, [isOwner, remoteStream]);
 
-  // Volume
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.volume = volume;
@@ -265,7 +301,7 @@ const StreamedVideoPlayer = ({
         <Film size={48} className="mb-4 text-blue-500" />
         <h3 className="text-xl font-bold text-white mb-2">Broadcast Video</h3>
         <p className="text-center max-w-md mb-6 text-sm">
-          Select a video file. It will be streamed directly to all guests. No upload wait time.
+          Select a video file. It will be streamed directly to all guests.
         </p>
         <label className="cursor-pointer bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-6 rounded-lg transition-all flex items-center gap-2 shadow-lg shadow-blue-900/50">
           <Upload size={18} />
@@ -296,6 +332,9 @@ const StreamedVideoPlayer = ({
   return (
     <div className="relative w-full h-full flex items-center justify-center bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-slate-800 group">
       <video
+        // KEY FIX: This forces the video element to be brand new when file changes.
+        // This ensures captureStream() works correctly every time.
+        key={isOwner ? localFileUrl : 'guest-player'}
         ref={videoRef}
         src={isOwner ? localFileUrl : undefined}
         className="w-full h-full object-contain"
@@ -336,6 +375,7 @@ export default function PArcApp() {
   const [user, setUser] = useState(null);
   const [view, setView] = useState('landing'); 
   const [isOwner, setIsOwner] = useState(false);
+  const [sessionId] = useState(() => Math.random().toString(36).substring(2)); // FIX: Unique session ID per tab load
   const isOnline = useConnectionStatus();
 
   // Room Data
@@ -390,12 +430,14 @@ export default function PArcApp() {
   useEffect(() => {
     if (!user || view !== 'room' || !roomData.id) return;
 
+    // FIX: Include sessionId so owner knows if we refreshed
     const userRef = doc(db, 'artifacts', appId, 'public', 'data', `parc_v2_${roomData.id}_users`, user.uid);
     setDoc(userRef, {
       uid: user.uid,
       name: roomData.username,
       color: roomData.color,
       isOwner: isOwner,
+      sessionId: sessionId, // Critical for refresh logic
       joinedAt: serverTimestamp()
     });
 
